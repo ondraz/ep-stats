@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from itertools import chain
-from typing import Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,13 @@ from ..prometheus import get_prometheus_metric
 from .check import Check
 from .metric import Metric, SimpleMetric
 from .parser import AggType, EpGoal, Goal, Parser, UnitType
-from .statistics import DEFAULT_CONFIDENCE_LEVEL, DEFAULT_POWER, Statistics
+from .statistics import (
+    DEFAULT_BOOTSTRAP_SAMPLES,
+    DEFAULT_BOOTSTRAP_SEED,
+    DEFAULT_CONFIDENCE_LEVEL,
+    DEFAULT_POWER,
+    Statistics,
+)
 from .utils import get_utc_timestamp, goals_wide_to_long
 
 check_evaluation_errors_metric = get_prometheus_metric(
@@ -165,6 +171,8 @@ class Experiment:
         filters: Optional[List[Filter]] = None,
         null_hypothesis_rate: Optional[float] = None,
         query_parameters: dict = {},
+        bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+        random_seed: Optional[int] = DEFAULT_BOOTSTRAP_SEED,
     ):
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self.id = id
@@ -208,6 +216,8 @@ class Experiment:
         self.filters = filters if filters is not None else []
         self.query_parameters = query_parameters
         self.null_hypothesis_rate = null_hypothesis_rate
+        self.bootstrap_samples = bootstrap_samples
+        self.random_seed = random_seed
 
     def _check_metric_ids_unique(self):
         """
@@ -219,6 +229,23 @@ class Experiment:
                 raise ValueError(
                     f"Metric ids must be unique. Id={id_} found more than once."
                 )
+
+    def _check_no_quantile_metrics(self):
+        """
+        Raises an exception if any metric uses a quantile `statistic`, which the pre-aggregated
+        evaluation path cannot support.
+        """
+        quantile_metrics = [m for m in self.metrics if m.is_quantile_statistic]
+        if quantile_metrics:
+            names = [
+                f"{m.id} ({m.name}, statistic='{m.statistic}')"
+                for m in quantile_metrics
+            ]
+            raise ValueError(
+                f"Metrics {names} use a quantile statistic, which cannot be evaluated from "
+                "pre-aggregated goals because a quantile is not recoverable from "
+                "`(count, sum_value, sum_sqr_value)`. Use `Experiment.evaluate_by_unit` instead."
+            )
 
     def _update_dimension_to_value(self):
         """
@@ -316,12 +343,14 @@ class Experiment:
         test-srm    a               test_unit_type_2    global      conversion      product_1           1000    1700            31000       55000           850
         ```
         """
+        self._check_no_quantile_metrics()
         g = self._fix_missing_agg(goals)
         return self._evaluate(
             g,
             Experiment._metrics_column_fce_agg,
             Experiment._checks_fce_agg,
             Experiment._exposures_fce_agg,
+            None,
         )
 
     def evaluate_wide_agg(self, goals: pd.DataFrame) -> Evaluation:
@@ -393,6 +422,7 @@ class Experiment:
         my-exp          d           474934  49090   289             11995       566700
         ```
         """
+        self._check_no_quantile_metrics()
         g = goals_wide_to_long(goals, self.unit_type)
         return self.evaluate_agg(g)
 
@@ -497,6 +527,7 @@ class Experiment:
             Experiment._metrics_column_fce_by_unit,
             Experiment._checks_fce_by_unit,
             Experiment._exposures_fce_by_unit,
+            Experiment._unit_values_fce_by_unit,
         )
 
     def get_goals(self) -> List[EpGoal]:
@@ -527,6 +558,14 @@ class Experiment:
         Gets count, sum_value, sum_sqr_value columns by expression from goals grouped by `unit_id`.
         """
         return m.get_evaluate_columns_by_unit(goals)
+
+    @staticmethod
+    def _unit_values_fce_by_unit(m: Metric, goals: pd.DataFrame):
+        """
+        Gets per-unit nominator values grouped by variant from goals grouped by `unit_id`. Needed by
+        statistics that are not recoverable from pre-aggregated data, i.e. quantiles.
+        """
+        return m.get_unit_values_by_variant(goals)
 
     @staticmethod
     def _checks_fce_agg(c: Check, goals: pd.DataFrame, control_variant: str):
@@ -579,9 +618,14 @@ class Experiment:
         return d
 
     def _evaluate(
-        self, goals: pd.DataFrame, metrics_column_fce, checks_fce, exposures_fce
+        self,
+        goals: pd.DataFrame,
+        metrics_column_fce,
+        checks_fce,
+        exposures_fce,
+        unit_values_fce=None,
     ):
-        metrics = self._evaluate_metrics(goals, metrics_column_fce)
+        metrics = self._evaluate_metrics(goals, metrics_column_fce, unit_values_fce)
         checks = self._evaluate_checks(goals, checks_fce)
         exposures = self._evaluate_exposures(goals, exposures_fce)
         return Evaluation(metrics, checks, exposures)
@@ -740,6 +784,7 @@ class Experiment:
         controls: dict,
         minimum_effects: dict,
         metrics_with_value_denominator: set,
+        quantile_metrics: set,
         n_variants: int,
     ) -> pd.Series:
         metric_id = metric_row["metric_id"]
@@ -760,6 +805,12 @@ class Experiment:
             minimum_effect
         ):
             return pd.Series([np.nan, sample_size, np.nan], index)
+
+        # The classical sample size formula needs the standard deviation of the compared statistic.
+        # For a quantile that is `sqrt(p(1-p)/n) / f(F^-1(p))`, which depends on the density at the
+        # quantile and is therefore not knowable before the experiment runs.
+        if metric_id in quantile_metrics:
+            return pd.Series([minimum_effect, sample_size, np.nan], index)
 
         metric_id = metric_row["metric_id"]
         return pd.Series(
@@ -795,12 +846,15 @@ class Experiment:
             if m.denominator.startswith("value(") and not isinstance(m, SimpleMetric)
         }
 
+        quantile_metrics = {m.id for m in self.metrics if m.is_quantile_statistic}
+
         return metrics.apply(
             lambda metric_row: self._get_required_sample_size(
                 metric_row=metric_row,
                 controls=controls,
                 minimum_effects=minimum_effects,
                 metrics_with_value_denominator=metrics_with_value_denominator,
+                quantile_metrics=quantile_metrics,
                 n_variants=n_variants,
             ),
             axis=1,
@@ -858,7 +912,75 @@ class Experiment:
                 " `evaluate_by_unit`."
             )
 
-    def _evaluate_metrics(self, goals: pd.DataFrame, column_fce) -> pd.DataFrame:
+    def _evaluate_quantile_metrics(
+        self,
+        c: pd.DataFrame,
+        goals: pd.DataFrame,
+        unit_values_fce: Optional[
+            Callable[[Metric, pd.DataFrame], Dict[str, np.array]]
+        ],
+        n_variants: int,
+        confidence_level: float,
+    ) -> pd.DataFrame:
+        """
+        Replace the t-test results of every quantile (median / percentile) metric with a bootstrap
+        evaluation of the relative difference in quantiles.
+
+        The mean-path row block layout is preserved so that the positional indexing used by
+        [`multiple_comparisons_correction`][epstats.toolkit.statistics.Statistics.multiple_comparisons_correction]
+        keeps working. `mean` carries the quantile point estimate for these metrics.
+
+        Arguments:
+            c: dataframe as output of
+                [`ttest_evaluation`][epstats.toolkit.statistics.Statistics.ttest_evaluation]
+            goals: goals aggregated by unit
+            unit_values_fce: function returning per-unit values by variant, `None` on the
+                pre-aggregated path where quantiles are impossible
+            n_variants: number of variants in the experiment
+            confidence_level: confidence level, already adjusted for sequential evaluation
+        """
+        if unit_values_fce is None:
+            return c
+
+        overwritten_columns = [
+            "diff",
+            "test_stat",
+            "p_value",
+            "confidence_interval",
+            "standard_error",
+            "degrees_of_freedom",
+        ]
+
+        for i, m in enumerate(self.metrics):
+            if not m.is_quantile_statistic:
+                continue
+
+            r = Statistics.quantile_bootstrap_evaluation(
+                values=unit_values_fce(m, goals),
+                quantile=m.quantile,
+                control_variant=self.control_variant,
+                confidence_level=confidence_level,
+                n_samples=self.bootstrap_samples,
+                random_state=self.random_seed,
+            ).set_index("exp_variant_id")
+
+            # `loc` slicing is inclusive on both ends and `c` is indexed by position of the row
+            index_from = i * n_variants
+            index_to = (i + 1) * n_variants - 1
+
+            # Align the bootstrap rows to the variant order of this metric's row block instead of
+            # relying on the order the values dictionary happens to have.
+            r = r.reindex(c.loc[index_from:index_to, "exp_variant_id"])
+
+            c.loc[index_from:index_to, "mean"] = r["quantile_estimate"].to_numpy()
+            for col in overwritten_columns:
+                c.loc[index_from:index_to, col] = r[col].to_numpy()
+
+        return c
+
+    def _evaluate_metrics(
+        self, goals: pd.DataFrame, column_fce, unit_values_fce=None
+    ) -> pd.DataFrame:
         if not self.metrics:
             return pd.DataFrame([], columns=Evaluation.metric_columns())
 
@@ -925,6 +1047,14 @@ class Experiment:
         # elements of `stats` array: metrics_id, exp_variant_id, count, mean, std, sum_value, confidence_level
         # hypothesis evaluation (standard way using t-test)
         c = Statistics.ttest_evaluation(stats, self.control_variant)
+
+        # quantile (median / percentile) metrics cannot be evaluated from the sufficient statistics
+        # above, so we recompute their rows from the per-unit values using the bootstrap. This runs
+        # before the multiple comparisons correction so that quantile p-values are corrected too, and
+        # it receives the already sequentially-adjusted `confidence_level`.
+        c = self._evaluate_quantile_metrics(
+            c, goals, unit_values_fce, n_variants, confidence_level
+        )
 
         # multiple variants (comparisons) correction - applied when we have multiple treatment variants
         if n_variants > 2:

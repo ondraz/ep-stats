@@ -314,3 +314,50 @@ def test_filter_scope_exposure_empty_dimension():
     json = resp.json()
     assert json["detail"][0]["loc"][0] == "body"
     assert json["detail"][0]["type"] == "value_error"
+
+
+def _metric_json_blob(**metric_overrides):
+    return {
+        "id": "test-conversions",
+        "control_variant": "a",
+        "unit_type": "test_unit_type",
+        "metrics": [
+            {
+                "id": 1,
+                "name": "Click-through Rate",
+                "nominator": "count(test_unit_type.unit.click)",
+                "denominator": "count(test_unit_type.global.exposure)",
+                **metric_overrides,
+            }
+        ],
+        "checks": [],
+    }
+
+
+def test_validate_metric_statistic_rejects_quantiles():
+    resp = client.post("/evaluate", json=_metric_json_blob(statistic="median"))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"][0]
+    # Quantiles need the individual per-unit values, which this API does not carry.
+    assert "not available via the pre-aggregated API" in detail["msg"]
+    assert "evaluate_by_unit" in detail["msg"]
+
+
+def test_validate_metric_statistic_rejects_percentiles():
+    resp = client.post("/evaluate", json=_metric_json_blob(statistic="p90"))
+
+    assert resp.status_code == 422
+    assert "p90" in resp.json()["detail"][0]["msg"]
+
+
+def test_metric_statistic_mean_is_accepted():
+    resp = client.post("/evaluate", json=_metric_json_blob(statistic="mean"))
+
+    assert resp.status_code == 200
+
+
+def test_metric_statistic_defaults_to_mean():
+    resp = client.post("/evaluate", json=_metric_json_blob())
+
+    assert resp.status_code == 200

@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,19 @@ DEFAULT_POWER = 0.8
 # It must stay below 1.0, otherwise t-quantiles and confidence intervals
 # computed from the adjusted confidence level become infinite.
 MAX_SEQUENTIAL_CONFIDENCE_LEVEL = 0.9999
+
+# Number of bootstrap resamples used to estimate the standard error of a relative
+# difference in quantiles. The bootstrap standard error itself carries a relative
+# Monte Carlo error of about `1 / sqrt(2 * B)`, i.e. ~2.2% at 1000 resamples, which
+# is negligible next to the sampling noise it estimates.
+DEFAULT_BOOTSTRAP_SAMPLES = 1000
+
+# Fixed default seed so that repeated evaluations of the same data are reproducible.
+DEFAULT_BOOTSTRAP_SEED = 84
+
+# Bootstrap replicates are generated in chunks of this many resamples at a time to bound
+# peak memory: a chunk materializes a `(chunk, n)` index matrix rather than `(B, n)`.
+_BOOTSTRAP_CHUNK_SIZE = 100
 
 
 class Statistics:
@@ -179,6 +192,220 @@ class Statistics:
         ]
         r = pd.DataFrame(arr, columns=col)
         return r
+
+    @classmethod
+    def _bootstrap_quantiles(
+        cls,
+        values: np.array,
+        quantile: float,
+        n_samples: int,
+        rng: np.random.Generator,
+    ) -> np.array:
+        """
+        Draw `n_samples` nonparametric bootstrap resamples of `values` and return the sample
+        `quantile` of each resample.
+
+        Resamples are generated in chunks (see `_BOOTSTRAP_CHUNK_SIZE`) so that peak memory stays
+        bounded by `chunk * n` instead of `n_samples * n`.
+
+        Arguments:
+            values: 1-d array of observed per-unit values
+            quantile: probability in `(0, 1)`, e.g. `0.5` for the median
+            n_samples: number of bootstrap resamples `B`
+            rng: random generator used to draw the resamples
+
+        Returns:
+            array of `n_samples` bootstrap quantile estimates
+        """
+        n = len(values)
+        estimates = np.empty(n_samples, dtype=float)
+        start = 0
+        while start < n_samples:
+            chunk = min(_BOOTSTRAP_CHUNK_SIZE, n_samples - start)
+            idx = rng.integers(0, n, size=(chunk, n))
+            estimates[start : start + chunk] = np.quantile(
+                values[idx], quantile, axis=1
+            )
+            start += chunk
+        return estimates
+
+    @classmethod
+    def quantile_bootstrap_evaluation(
+        cls,
+        values: Dict[str, np.array],
+        quantile: float,
+        control_variant: str,
+        confidence_level: float,
+        n_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+        random_state: Optional[int] = DEFAULT_BOOTSTRAP_SEED,
+    ) -> pd.DataFrame:
+        """
+        Testing statistical significance of the relative difference in a quantile (median,
+        percentile) of treatment and control variant.
+
+        Unlike a mean, a sample quantile has no standard error computable from the sufficient
+        statistics `(count, sum_value, sum_sqr_value)`: its asymptotic standard error
+        `sqrt(p(1-p)/n) / f(F^-1(p))` depends on the unknown density `f` at the quantile. This
+        method therefore estimates the standard error with
+        [Efron's nonparametric bootstrap](https://en.wikipedia.org/wiki/Bootstrapping_(statistics)):
+        it resamples each variant with replacement, recomputes the relative difference in quantiles
+        on every replicate, and takes the empirical standard deviation of those replicates.
+
+        Because sample quantiles are asymptotically normal
+        ([Bahadur representation](https://en.wikipedia.org/wiki/Quantile#Asymptotic_distribution)),
+        the resulting Wald-type test statistic, p-value and symmetric confidence interval have the
+        same form as on the mean path and plug into the rest of the pipeline (Holm-Bonferroni
+        correction, sequential confidence-level adjustment) unchanged.
+        [Complete manual](../stats/percentiles.md)
+
+        Arguments:
+            values: dictionary mapping `exp_variant_id` to that variant's 1-d array of per-unit values
+            quantile: probability in `(0, 1)` of the compared quantile, e.g. `0.5` for the median
+            control_variant: string with the name of control variant
+            confidence_level: confidence level used to calculate `p_value` and `confidence_interval`,
+                already adjusted for sequential evaluation by the caller
+            n_samples: number of bootstrap resamples `B`
+            random_state: seed of the bootstrap random generator, fixed by default so that repeated
+                evaluations of the same data return identical results
+
+        Returns:
+            dataframe with one row per variant, in the order of `values`
+
+        Schema of returned dataframe:
+
+        1. `exp_variant_id` - variant id
+        1. `quantile_estimate` - the sample quantile of this variant, the point estimate
+        1. `diff` - relative difference between the quantile of this and control variant
+        1. `test_stat` - value of test statistic of the relative difference in quantiles
+        1. `p_value` - p-value of the test statistic under `confidence_level`
+        1. `confidence_interval` - half-width of the confidence interval of `diff`
+        1. `standard_error` - bootstrap standard error of the `diff`
+        1. `degrees_of_freedom` - `n_treatment + n_control - 2`
+        """
+        rng = np.random.default_rng(random_state)
+
+        control_values = values.get(control_variant)
+        control_n = 0 if control_values is None else len(control_values)
+        # A quantile of a single observation carries no information about its own variability,
+        # so the bootstrap cannot produce a usable standard error below two observations.
+        control_usable = control_n >= 2
+
+        if control_usable:
+            control_quantile = float(np.quantile(control_values, quantile))
+            control_boot = cls._bootstrap_quantiles(
+                control_values, quantile, n_samples, rng
+            )
+        else:
+            control_quantile = np.nan
+            control_boot = None
+
+        res = []
+        for variant, variant_values in values.items():
+            variant_n = 0 if variant_values is None else len(variant_values)
+
+            if not control_usable or variant_n < 2:
+                res.append(
+                    (
+                        variant,
+                        float(np.quantile(variant_values, quantile))
+                        if variant_n > 0
+                        else np.nan,
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                        np.nan,
+                    )
+                )
+                continue
+
+            variant_quantile = float(np.quantile(variant_values, quantile))
+            f = float(variant_n + control_n - 2)  # degrees of freedom
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                # A zero control quantile makes the relative difference undefined. We let it
+                # produce inf / nan here, the same convention as the mean path uses when goal
+                # data are missing for some variant.
+                rel_diff = (variant_quantile - control_quantile) / np.abs(
+                    control_quantile
+                )
+
+            if variant == control_variant:
+                # The control variant is compared against itself, so its relative difference is
+                # exactly zero. To mirror the mean path -- whose control row still reports a
+                # standard error, computed as if the control were compared against an independent
+                # variant with identical distribution -- we bootstrap a second, independent
+                # replicate vector of the control instead of reusing `control_boot` (which would
+                # cancel to exactly zero).
+                variant_boot = cls._bootstrap_quantiles(
+                    control_values, quantile, n_samples, rng
+                )
+            else:
+                variant_boot = cls._bootstrap_quantiles(
+                    variant_values, quantile, n_samples, rng
+                )
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                # Resampling is independent across variants, so pairing replicate `b` of the
+                # treatment with replicate `b` of the control is arbitrary but valid, and
+                # bootstraps the ratio directly instead of assembling it from two separate SEs.
+                rel_diff_boot = (variant_boot - control_boot) / np.abs(control_boot)
+
+            # Replicates where the control quantile came out zero make the ratio undefined.
+            # They are dropped so a single degenerate replicate does not wipe out the estimate.
+            rel_diff_boot = rel_diff_boot[np.isfinite(rel_diff_boot)]
+            standard_error = (
+                float(np.std(rel_diff_boot, ddof=1))
+                if len(rel_diff_boot) >= 2
+                else np.nan
+            )
+
+            if not np.isfinite(standard_error) or standard_error == 0:
+                # Degenerate / heavily tied data: every resample yields the same quantile, so
+                # the bootstrap sees no variability. There is no evidence of a difference to
+                # report, so we deliberately emit no test rather than an infinite statistic.
+                test_stat = 0.0
+                p_value = np.nan
+                conf_int = np.nan
+                standard_error = 0.0 if np.isfinite(standard_error) else standard_error
+            else:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    test_stat = rel_diff / standard_error
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=RuntimeWarning)
+                    p_value = 2 * (1 - st.t.cdf(np.abs(test_stat), f))
+                    t_quantile = st.t.ppf(
+                        confidence_level + (1 - confidence_level) / 2, f
+                    )
+                conf_int = standard_error * t_quantile
+
+            res.append(
+                (
+                    variant,
+                    variant_quantile,
+                    rel_diff,
+                    test_stat,
+                    p_value,
+                    conf_int,
+                    standard_error,
+                    f,
+                )
+            )
+
+        return pd.DataFrame(
+            res,
+            columns=[
+                "exp_variant_id",
+                "quantile_estimate",
+                "diff",
+                "test_stat",
+                "p_value",
+                "confidence_interval",
+                "standard_error",
+                "degrees_of_freedom",
+            ],
+        )
 
     @classmethod
     def multiple_comparisons_correction(

@@ -72,3 +72,10 @@ Over the HTTP API the same parameters are available on the metric definition as
 - The standard deviation reported after winsorization is the ordinary (capped) sample standard
   deviation. With large samples and a small capped fraction the difference from a dedicated
   winsorized-variance estimator is negligible.
+
+## See also
+
+Winsorization keeps estimating a *mean*, only of a capped metric. If you care about the typical unit
+rather than the total, [Median and Percentile Metrics](percentiles.md) compare a quantile directly.
+The two compose: winsorization cannot move a quantile that lies outside the capped tails, so a
+median metric is invariant to a small amount of winsorization.

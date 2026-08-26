@@ -1,4 +1,5 @@
-from typing import Optional, Set
+import re
+from typing import Dict, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ class Metric:
         minimum_effect: Optional[float] = None,
         outlier_upper_percentile: Optional[float] = None,
         outlier_lower_percentile: Optional[float] = None,
+        statistic: str = "mean",
     ):
         """
         Constructor of the general metric definition.
@@ -52,6 +54,14 @@ class Metric:
                 to `outlier_upper_percentile`. Usually left as `None` because heavy-tailed metrics (revenue,
                 time spent, ...) typically only have outliers in the upper tail while the lower tail is made of
                 legitimate zeros.
+            statistic: which statistic of the per-unit nominator values to compare between variants.
+                `'mean'` (default) runs the usual Welch's t-test on the relative difference in means.
+                `'median'` or `'p<number>'` (e.g. `'p90'`, `'p99.5'`, with the number in `(0, 100)`)
+                compares the given quantile instead, with the standard error of the relative difference
+                estimated by bootstrap. See [Median and Percentile Metrics](../stats/percentiles.md).
+                Quantile statistics need the individual per-unit values, so they are supported only by
+                [`evaluate_by_unit`][epstats.toolkit.experiment.Experiment.evaluate_by_unit];
+                [`evaluate_agg`][epstats.toolkit.experiment.Experiment.evaluate_agg] raises a `ValueError`.
 
         Usage:
 
@@ -69,6 +79,7 @@ class Metric:
         self._validate_outlier_percentile(
             "outlier_lower_percentile", outlier_lower_percentile
         )
+        self.statistic, self.quantile = self._parse_statistic(statistic)
 
         self.id = id
         self.name = name
@@ -81,6 +92,7 @@ class Metric:
         self.minimum_effect = minimum_effect
         self.outlier_upper_percentile = outlier_upper_percentile
         self.outlier_lower_percentile = outlier_lower_percentile
+        self._validate_quantile_not_winsorized()
 
     @staticmethod
     def _validate_outlier_percentile(name: str, percentile: Optional[float]) -> None:
@@ -88,6 +100,68 @@ class Metric:
             raise ValueError(
                 f"`{name}` must be in `[0, 50)` but `{percentile}` received."
             )
+
+    _MEAN_STATISTIC = "mean"
+    _MEDIAN_STATISTIC = "median"
+    _PERCENTILE_PATTERN = re.compile(r"^p(\d+(?:\.\d+)?)$")
+
+    @classmethod
+    def _parse_statistic(cls, statistic: str) -> (str, Optional[float]):
+        """
+        Normalize the `statistic` argument into a `(statistic, quantile)` pair where `quantile` is
+        `None` for the mean and the probability in `(0, 1)` for a quantile statistic.
+        """
+        if not isinstance(statistic, str):
+            raise ValueError(
+                f"`statistic` must be a string but `{type(statistic).__name__}` received."
+            )
+
+        normalized = statistic.strip().lower()
+        if normalized == cls._MEAN_STATISTIC:
+            return cls._MEAN_STATISTIC, None
+        if normalized == cls._MEDIAN_STATISTIC:
+            return cls._MEDIAN_STATISTIC, 0.5
+
+        match = cls._PERCENTILE_PATTERN.match(normalized)
+        if match:
+            percentile = float(match.group(1))
+            if not 0 < percentile < 100:
+                raise ValueError(
+                    f"Percentile of `statistic` must be in `(0, 100)` but `{statistic}` received."
+                )
+            return normalized, percentile / 100
+
+        raise ValueError(
+            f"`statistic` must be one of `mean`, `median`, `p<number>` (e.g. `p90`) "
+            f"but `{statistic}` received."
+        )
+
+    def _validate_quantile_not_winsorized(self) -> None:
+        """
+        Reject metric definitions where the requested quantile lies inside a winsorized tail.
+
+        Winsorization cannot change a quantile strictly inside the retained range, but a quantile
+        that falls in a capped tail would be flattened to the cap itself, making the comparison
+        between variants meaningless.
+        """
+        if not self.is_quantile_statistic:
+            return
+
+        lower_quantile, upper_quantile = self._get_outlier_quantiles()
+        if self.quantile <= lower_quantile or self.quantile >= upper_quantile:
+            raise ValueError(
+                f"`statistic='{self.statistic}'` (quantile `{self.quantile}`) falls inside a "
+                f"winsorized tail `[0, {lower_quantile}] / [{upper_quantile}, 1]`. Winsorization "
+                f"would flatten the quantile to the cap. Pick a quantile inside "
+                f"`({lower_quantile}, {upper_quantile})` or relax the outlier percentiles."
+            )
+
+    @property
+    def is_quantile_statistic(self) -> bool:
+        """
+        `True` when the metric compares a quantile (median / percentile) instead of the mean.
+        """
+        return self.quantile is not None
 
     def get_goals(self) -> Set:
         """
@@ -109,7 +183,18 @@ class Metric:
         Returns:
             numpy array of shape (variants, metrics) where metrics are in order of
             (count, sum_value, sum_sqr_value)
+
+        Raises:
+            ValueError: when the metric uses a quantile `statistic`. A quantile cannot be recovered
+                from the pre-aggregated `(count, sum_value, sum_sqr_value)` sufficient statistics.
         """
+        if self.is_quantile_statistic:
+            raise ValueError(
+                f"Metric `{self.id}` (`{self.name}`) uses `statistic='{self.statistic}'`, which "
+                "cannot be evaluated from pre-aggregated goals because a quantile is not "
+                "recoverable from `(count, sum_value, sum_sqr_value)`. Use "
+                "`Experiment.evaluate_by_unit` instead."
+            )
         return self._parser.evaluate_agg(goals)
 
     def get_evaluate_columns_by_unit(self, goals: pd.DataFrame) -> np.array:
@@ -129,6 +214,33 @@ class Metric:
         """
         lower_quantile, upper_quantile = self._get_outlier_quantiles()
         return self._parser.evaluate_by_unit(goals, lower_quantile, upper_quantile)
+
+    def get_unit_values_by_variant(self, goals: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """
+        Get the (optionally winsorized) per-unit nominator values grouped by experiment variant.
+
+        Needed by statistics that are not recoverable from the pre-aggregated sufficient statistics,
+        i.e. quantiles. The values are the per-unit nominator values including the zeros of exposed
+        units without the goal.
+
+        Arguments:
+            goals: goals aggregated by unit, as passed to
+                [`Experiment.evaluate_by_unit`][epstats.toolkit.experiment.Experiment.evaluate_by_unit]
+
+        Returns:
+            dictionary mapping `exp_variant_id` to the 1-d numpy array of that variant's per-unit values
+        """
+        lower_quantile, upper_quantile = self._get_outlier_quantiles()
+        value_variants, value = self._parser.evaluate_unit_values(
+            goals, lower_quantile, upper_quantile
+        )
+        values_df = pd.DataFrame(
+            {"exp_variant_id": np.asarray(value_variants), "value": np.asarray(value)}
+        )
+        return {
+            variant: group["value"].to_numpy(dtype=float)
+            for variant, group in values_df.groupby("exp_variant_id")
+        }
 
     def _get_outlier_quantiles(self) -> (float, float):
         """
@@ -158,6 +270,7 @@ class SimpleMetric(Metric):
         minimum_effect: Optional[float] = None,
         outlier_upper_percentile: Optional[float] = None,
         outlier_lower_percentile: Optional[float] = None,
+        statistic: str = "mean",
     ):
         """
         Constructor of the simplified metric definition.
@@ -174,6 +287,8 @@ class SimpleMetric(Metric):
             unit_type: unit type
             metric_format: specify format of the metric, e.g. '${:,.1f}' for RPM
             metric_value_multiplier: specify multiplier, e.g. 1000 for RPM
+            statistic: statistic to compare between variants, `'mean'` (default), `'median'` or
+                `'p<number>'` -- see [`Metric`][epstats.toolkit.metric.Metric]
 
         Usage:
 
@@ -202,4 +317,5 @@ class SimpleMetric(Metric):
             minimum_effect,
             outlier_upper_percentile,
             outlier_lower_percentile,
+            statistic,
         )

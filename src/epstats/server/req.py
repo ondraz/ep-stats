@@ -71,6 +71,25 @@ class Metric(BaseModel):
         tail. Applies only to by-unit evaluation. Defaults to no winsorization.""",
     )
 
+    statistic: str = Field(
+        "mean",
+        title="Compared statistic",
+        description="""Which statistic of the metric to compare between variants. Only `mean` is supported
+        over this pre-aggregated API: median and percentile metrics need the individual per-unit values,
+        which the aggregated request format does not carry.""",
+    )
+
+    @model_validator(mode="after")
+    def check_statistic(self):
+        if self.statistic != "mean":
+            raise ValueError(
+                f"`statistic='{self.statistic}'` is not available via the pre-aggregated API because "
+                "a quantile cannot be recovered from `(count, sum_value, sum_sqr_value)`. Only "
+                "`statistic='mean'` is supported here, use `Experiment.evaluate_by_unit` in the "
+                "toolkit for median / percentile metrics."
+            )
+        return self
+
     @model_validator(mode="after")
     def check_nominator_denominator(self):
         nominator, denominator = self.nominator, self.denominator
@@ -99,6 +118,7 @@ class Metric(BaseModel):
             minimum_effect=self.minimum_effect,
             outlier_upper_percentile=self.outlier_upper_percentile,
             outlier_lower_percentile=self.outlier_lower_percentile,
+            statistic=self.statistic,
         )
 
 
