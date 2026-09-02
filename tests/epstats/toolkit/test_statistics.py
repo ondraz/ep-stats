@@ -299,3 +299,163 @@ def test_false_positive_risk():
     )
 
     assert false_positive_risk == 0.05966162065894922
+
+
+# --------------------------------------------------------------------------------------
+# quantile bootstrap evaluation
+# --------------------------------------------------------------------------------------
+
+# Asymptotic standard error of the median of a normal sample is
+# `sqrt(pi / 2) * sigma / sqrt(n)`, i.e. about 25% larger than the standard error of the mean.
+MEDIAN_SE_FACTOR = np.sqrt(np.pi / 2)
+
+
+def test_bootstrap_standard_error_of_median_matches_asymptotic_formula():
+    # The bootstrap standard error is itself a noisy estimate (relative Monte Carlo error
+    # ~1/sqrt(2B) plus the slow convergence of the bootstrap for medians), so we average it
+    # over independent samples before comparing it to the analytic value.
+    rng = np.random.default_rng(101)
+    n = 2000
+    sigma = 2.0
+    mu = 10.0
+
+    # Standard error of the *relative* difference of two independent medians:
+    # sqrt(2) * SE(median) / |median|.
+    expected = np.sqrt(2) * MEDIAN_SE_FACTOR * sigma / np.sqrt(n) / mu
+
+    estimates = []
+    for _ in range(20):
+        control = rng.normal(mu, sigma, n)
+        treatment = rng.normal(mu, sigma, n)
+        r = Statistics.quantile_bootstrap_evaluation(
+            {"a": control, "b": treatment}, 0.5, "a", 0.95
+        ).set_index("exp_variant_id")
+        estimates.append(r.loc["b", "standard_error"])
+
+    assert np.mean(estimates) == pytest.approx(expected, rel=0.1)
+
+
+def test_bootstrap_median_standard_error_exceeds_mean_standard_error():
+    rng = np.random.default_rng(102)
+    n = 4000
+    sigma = 3.0
+    mu = 20.0
+    control = rng.normal(mu, sigma, n)
+    treatment = rng.normal(mu, sigma, n)
+
+    r = Statistics.quantile_bootstrap_evaluation(
+        {"a": control, "b": treatment}, 0.5, "a", 0.95
+    ).set_index("exp_variant_id")
+
+    # Standard error of the relative difference in means, for reference.
+    mean_se = np.sqrt(2) * sigma / np.sqrt(n) / mu
+    # The median pays about a 25% standard error premium on normal data.
+    assert r.loc["b", "standard_error"] == pytest.approx(
+        MEDIAN_SE_FACTOR * mean_se, rel=0.15
+    )
+
+
+def test_bootstrap_standard_error_scales_with_sample_size():
+    rng = np.random.default_rng(103)
+    sigma = 2.0
+    mu = 10.0
+
+    def mean_se(n):
+        # A single bootstrap standard error is too noisy to compare directly, so average
+        # over independent samples.
+        estimates = [
+            Statistics.quantile_bootstrap_evaluation(
+                {"a": rng.normal(mu, sigma, n), "b": rng.normal(mu, sigma, n)},
+                0.5,
+                "a",
+                0.95,
+                n_samples=300,
+            ).set_index("exp_variant_id")["standard_error"]["b"]
+            for _ in range(15)
+        ]
+        return np.mean(estimates)
+
+    # Quadrupling the sample size should roughly halve the standard error.
+    assert mean_se(500) / mean_se(2000) == pytest.approx(2.0, rel=0.15)
+
+
+def test_bootstrap_confidence_interval_covers_true_relative_difference():
+    # Coverage sanity check: a 95% interval should contain the true relative difference in
+    # medians for the large majority of independent replications.
+    rng = np.random.default_rng(104)
+    n = 800
+    sigma = 2.0
+    mu_c, mu_t = 10.0, 10.5
+    true_diff = (mu_t - mu_c) / abs(mu_c)
+
+    covered = 0
+    replications = 40
+    for _ in range(replications):
+        r = Statistics.quantile_bootstrap_evaluation(
+            {"a": rng.normal(mu_c, sigma, n), "b": rng.normal(mu_t, sigma, n)},
+            0.5,
+            "a",
+            0.95,
+            n_samples=200,
+        ).set_index("exp_variant_id")
+        diff = r.loc["b", "diff"]
+        half_width = r.loc["b", "confidence_interval"]
+        if abs(diff - true_diff) <= half_width:
+            covered += 1
+
+    # Nominal coverage is 95%; allow for Monte Carlo noise over 40 replications.
+    assert covered >= 33, f"only {covered}/{replications} intervals covered"
+
+
+def test_bootstrap_evaluation_of_percentile_recovers_shift():
+    rng = np.random.default_rng(105)
+    n = 5000
+    # A pure location shift moves every quantile by the same amount.
+    control = rng.normal(100, 10, n)
+    treatment = control + 5
+
+    r = Statistics.quantile_bootstrap_evaluation(
+        {"a": control, "b": treatment}, 0.9, "a", 0.95
+    ).set_index("exp_variant_id")
+
+    expected = (np.quantile(treatment, 0.9) - np.quantile(control, 0.9)) / abs(
+        np.quantile(control, 0.9)
+    )
+    assert r.loc["b", "quantile_estimate"] == pytest.approx(np.quantile(treatment, 0.9))
+    assert r.loc["b", "diff"] == pytest.approx(expected)
+    assert r.loc["b", "p_value"] < 0.001
+
+
+def test_bootstrap_evaluation_is_reproducible_for_a_fixed_seed():
+    rng = np.random.default_rng(106)
+    values = {"a": rng.normal(10, 2, 300), "b": rng.normal(11, 2, 300)}
+
+    first = Statistics.quantile_bootstrap_evaluation(values, 0.5, "a", 0.95)
+    second = Statistics.quantile_bootstrap_evaluation(values, 0.5, "a", 0.95)
+
+    assert first.equals(second)
+
+
+def test_bootstrap_evaluation_returns_one_row_per_variant_in_input_order():
+    rng = np.random.default_rng(107)
+    values = {
+        "b": rng.normal(10, 2, 200),
+        "a": rng.normal(10, 2, 200),
+        "c": rng.normal(10, 2, 200),
+    }
+
+    r = Statistics.quantile_bootstrap_evaluation(values, 0.5, "a", 0.95)
+
+    assert list(r["exp_variant_id"]) == ["b", "a", "c"]
+    assert list(r["degrees_of_freedom"]) == [398.0, 398.0, 398.0]
+
+
+def test_bootstrap_evaluation_without_control_variant_is_all_nan():
+    rng = np.random.default_rng(108)
+
+    r = Statistics.quantile_bootstrap_evaluation(
+        {"b": rng.normal(10, 2, 100)}, 0.5, "a", 0.95
+    ).set_index("exp_variant_id")
+
+    assert np.isnan(r.loc["b", "diff"])
+    assert np.isnan(r.loc["b", "standard_error"])

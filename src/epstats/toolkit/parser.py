@@ -136,12 +136,9 @@ class Parser:
             numpy array of shape (variants, metrics) where metrics are in order of
             (count, sum_value, sum_sqr_value)
         """
-        value_variants, value = self._nominator_expr.evaluate_by_unit(
-            goals, "sum_value"
+        value_variants, value = self.evaluate_unit_values(
+            goals, lower_quantile, upper_quantile
         )
-
-        if lower_quantile > 0.0 or upper_quantile < 1.0:
-            value = self._winsorize(value, lower_quantile, upper_quantile)
 
         value_df = (
             pd.DataFrame(
@@ -164,6 +161,43 @@ class Parser:
 
         metrics_df = value_df.join(count_df)
         return metrics_df["count"], metrics_df["sum_value"], metrics_df["sum_sqr_value"]
+
+    def evaluate_unit_values(
+        self,
+        goals: pd.DataFrame,
+        lower_quantile: float = 0.0,
+        upper_quantile: float = 1.0,
+    ):
+        """
+        Get the (optionally winsorized) per-unit nominator values together with the variant each
+        value belongs to.
+
+        This is the only place in ep-stats that exposes individual per-unit values instead of
+        pre-aggregated sufficient statistics. Statistics that are not recoverable from
+        `(count, sum_value, sum_sqr_value)` -- quantiles in particular -- are computed from it.
+
+        Arguments:
+            goals: one row per experiment variant
+            lower_quantile: per-unit nominator values below this pooled quantile (in `[0, 1]`) are capped
+                (winsorized) to it. `0.0` caps nothing.
+            upper_quantile: per-unit nominator values above this pooled quantile (in `[0, 1]`) are capped
+                (winsorized) to it. `1.0` caps nothing.
+
+        See [`Experiment.evaluate_by_unit`][epstats.toolkit.experiment.Experiment.evaluate_by_unit] for
+        details on `goals` at input.
+
+        Returns:
+            tuple of two parallel series `(value_variants, value)` -- the variant id of every unit and
+            the per-unit nominator value of that unit
+        """
+        value_variants, value = self._nominator_expr.evaluate_by_unit(
+            goals, "sum_value"
+        )
+
+        if lower_quantile > 0.0 or upper_quantile < 1.0:
+            value = self._winsorize(value, lower_quantile, upper_quantile)
+
+        return value_variants, value
 
     @staticmethod
     def _winsorize(

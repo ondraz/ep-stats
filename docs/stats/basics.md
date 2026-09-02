@@ -40,6 +40,11 @@ The solution itself is pretty simple. In the beginning (circa first half of the 
 
 Main disadvantage is that the [length of the experiment must be set in advance](../user_guide/protocol.md#set-experiment-duration-before-starting-it) - before starting the experiment. This is very annoying for the experimenters (test owners) but right now this is the only way, how to deal with this issue. If we do not use Sequential testing, our false-positive errors could be somewhere between 20-30%, instead of required below 5%. It means one third of all presented results are wrong and without any chance to fix them. In other words, one third of decisions are wrong.
 
+### Heavy Tails and Extreme Values
+Welch's t-test needs a finite variance, and it only has useful power when that variance is not dominated by a handful of units. Revenue, time spent and similar metrics are heavy-tailed: a few extreme units drive most of the variance, the confidence interval is wide, and a real change in what the typical user does can stay undetected.
+
+Two corrections are available. [Outlier winsorization](outliers.md) caps the most extreme per-unit values before the mean is computed, keeping the estimand a mean while cutting the variance. [Median and percentile metrics](percentiles.md) change the estimand instead and compare a quantile of the distribution, with the standard error estimated by bootstrap because a quantile has none computable from the aggregated data.
+
 ## Data Quality Checks
 Experimentation Platform is very complex. From data collection to statistical evaluation, there are many intermediate steps. All of these steps must be checked regularly in order to guarantee trustworthiness of presented results.
 
